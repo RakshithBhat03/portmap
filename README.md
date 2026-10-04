@@ -4,6 +4,12 @@ A bookmark page for everything listening on localhost. portmap finds your runnin
 labels them by project and page title, takes a small screenshot of each, and gives you one page
 to click through. It lives at **http://localhost:7878**.
 
+![Grid view in the default dark theme, with pinned, running and recently stopped services](docs/screenshots/grid-dark.png)
+
+![List view in the light theme](docs/screenshots/list-light.png)
+
+<sub>Screenshots use demo projects.</sub>
+
 - **Auto-discovers** HTTP services on every port above 1024 (via `lsof`). Labels come from the
   process's working directory (nearest `package.json` / `Cargo.toml` / `.git` …) and the page `<title>`.
 - **Keeps itself clean.** New services appear within seconds. Stopped ones are marked
