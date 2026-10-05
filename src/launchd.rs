@@ -55,12 +55,29 @@ fn plist(exe: &Path, port: u16, log: &Path) -> String {
     )
 }
 
+/// Homebrew installs into a versioned keg (`<prefix>/Cellar/portmap/0.1.0/bin/portmap`) that
+/// `brew upgrade` + `brew cleanup` deletes. Point the agent at the stable `<prefix>/opt/portmap`
+/// symlink instead so it survives upgrades.
+fn stable_exe(exe: &Path) -> PathBuf {
+    let parts: Vec<_> = exe.components().collect();
+    if let Some(i) = parts.iter().position(|c| c.as_os_str() == "Cellar") {
+        if parts.len() > i + 3 {
+            let mut out: PathBuf = parts[..i].iter().collect();
+            out.push("opt");
+            out.push(parts[i + 1]);
+            out.extend(&parts[i + 3..]);
+            return out;
+        }
+    }
+    exe.to_path_buf()
+}
+
 pub fn install(port: u16, data_dir: &Path) -> Result<(), String> {
     if !cfg!(target_os = "macos") {
         return Err("`install` uses launchd and is macOS-only; on Linux run `portmap serve` from a systemd user unit".into());
     }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let exe = exe.canonicalize().unwrap_or(exe);
+    let exe = stable_exe(&exe.canonicalize().unwrap_or(exe));
     let log = data_dir.join("portmap.log");
     let plist = plist(&exe, port, &log);
     let path = plist_path();
@@ -125,6 +142,25 @@ mod tests {
         assert!(xml.contains("<key>KeepAlive</key><true/>"));
         assert!(xml
             .contains("<key>StandardOutPath</key><string>/Users/x/.portmap/portmap.log</string>"));
+    }
+
+    #[test]
+    fn homebrew_keg_maps_to_stable_opt_path() {
+        assert_eq!(
+            stable_exe(Path::new("/opt/homebrew/Cellar/portmap/0.1.0/bin/portmap")),
+            PathBuf::from("/opt/homebrew/opt/portmap/bin/portmap")
+        );
+        assert_eq!(
+            stable_exe(Path::new("/usr/local/Cellar/portmap/0.2.0_1/bin/portmap")),
+            PathBuf::from("/usr/local/opt/portmap/bin/portmap")
+        );
+    }
+
+    #[test]
+    fn non_homebrew_paths_are_unchanged() {
+        for p in ["/Users/x/.cargo/bin/portmap", "/tmp/Cellar/portmap"] {
+            assert_eq!(stable_exe(Path::new(p)), PathBuf::from(p));
+        }
     }
 
     #[test]

@@ -1,0 +1,44 @@
+name: Release
+
+# Pushing a vX.Y.Z tag points the Homebrew formula in RakshithBhat03/homebrew-tap at the new
+# source tarball. Needs a HOMEBREW_TAP_TOKEN secret: a fine-grained PAT with contents read/write
+# on the tap repo only.
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  bump-formula:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check token
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::HOMEBREW_TAP_TOKEN is not set; update the tap formula by hand"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: RakshithBhat03/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Point formula at the new tag
+        run: |
+          url="https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz"
+          sha=$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)
+          sed -i -E \
+            -e "s|^  url \".*\"|  url \"$url\"|" \
+            -e "s|^  sha256 \".*\"|  sha256 \"$sha\"|" \
+            Formula/portmap.rb
+          git diff
+
+      - name: Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "portmap ${GITHUB_REF_NAME#v}"
+          git push
