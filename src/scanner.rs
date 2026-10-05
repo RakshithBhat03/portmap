@@ -4,6 +4,7 @@
 
 use crate::scan;
 use crate::store::{now, Entry};
+use crate::tailnet;
 use crate::Shared;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,6 +26,8 @@ const IDLE_INTERVAL: Duration = Duration::from_secs(30);
 const REPROBE_SECS: u64 = 60;
 const THUMB_MAX_AGE_SECS: u64 = 15 * 60;
 const THUMB_RETRY_SECS: u64 = 10 * 60;
+/// Tailscale state rarely changes; share/unshare re-read it immediately anyway.
+const TAILNET_INTERVAL: Duration = Duration::from_secs(30);
 
 pub fn run(shared: Arc<Shared>, rx: Receiver<ScanMsg>) {
     run_with(&shared, rx, cycle)
@@ -65,6 +68,7 @@ fn run_with(shared: &Shared, rx: Receiver<ScanMsg>, mut scan: impl FnMut(&Shared
 }
 
 pub fn cycle(shared: &Shared, force: bool) {
+    refresh_tailnet(shared, force);
     let listeners = relevant(shared, scan::listeners());
     let pids: Vec<u32> = {
         let mut p: Vec<u32> = listeners.iter().map(|l| l.pid).collect();
@@ -76,6 +80,51 @@ pub fn cycle(shared: &Shared, force: bool) {
     let cwds = scan::process_cwds(&pids);
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     update(shared, listeners, &args, &cwds, &home, force);
+}
+
+fn refresh_tailnet(shared: &Shared, force: bool) {
+    let Some(cli) = &shared.cfg.tailscale else {
+        return;
+    };
+    let due = force
+        || shared
+            .store
+            .lock()
+            .unwrap()
+            .tailnet_checked
+            .is_none_or(|t| t.elapsed() >= TAILNET_INTERVAL);
+    if due {
+        let started = Instant::now();
+        set_tailnet(shared, started, tailnet::detect(cli));
+    }
+}
+
+/// Stores Tailscale state read at `started`; the caller's next `refresh_view` publishes it.
+/// A read that started before the latest stored one is dropped, so a slow scan can't undo a
+/// share that just happened. CLI failures keep the last good state for a couple of tries
+/// rather than flapping links and the Host guard while tailscaled restarts.
+pub fn set_tailnet(
+    shared: &Shared,
+    started: Instant,
+    result: Result<Option<tailnet::Tailnet>, String>,
+) {
+    let mut store = shared.store.lock().unwrap();
+    if store.tailnet_checked.is_some_and(|c| c > started) {
+        return;
+    }
+    store.tailnet_checked = Some(started);
+    match result {
+        Ok(t) => {
+            store.tailnet = t;
+            store.tailnet_failures = 0;
+        }
+        Err(_) => {
+            store.tailnet_failures += 1;
+            if store.tailnet_failures >= 3 {
+                store.tailnet = None;
+            }
+        }
+    }
 }
 
 /// Privileged ports, portmap's own UI port, and portmap itself are never bookmarks.
@@ -152,6 +201,7 @@ fn update(
         }
         e.listening = true;
         e.pid = l.pid;
+        e.addrs = l.addrs.clone();
         e.last_seen = t;
         e.runtime = Some(scan::runtime_label(argv, &l.command));
         e.app = scan::is_desktop_app(argv);

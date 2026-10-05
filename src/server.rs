@@ -1,8 +1,9 @@
 //! HTTP surface: static UI, a versioned state endpoint (304 when unchanged), actions,
 //! and cached thumbnails. Bound to loopback with a Host-header guard against DNS rebinding.
 
-use crate::scanner::ScanMsg;
+use crate::scanner::{self, ScanMsg};
 use crate::store::Store;
+use crate::tailnet;
 use crate::Shared;
 use serde::Deserialize;
 use std::io::Read;
@@ -55,33 +56,56 @@ fn req_header<'a>(req: &'a Request, name: &'static str) -> Option<&'a str> {
         .map(|h| h.value.as_str())
 }
 
-fn host_ok(req: &Request, port: u16) -> bool {
-    host_allowed(req_header(req, "Host"), port)
+fn host_ok(req: &Request, port: u16, extra: &[String]) -> bool {
+    host_allowed(req_header(req, "Host"), port, extra)
 }
 
-fn host_allowed(host: Option<&str>, port: u16) -> bool {
+/// Loopback names are always allowed. `extra` holds hostnames the user opted into with
+/// `PORTMAP_ALLOWED_HOSTS` (e.g. a `tailscale serve` name, which arrives without a port).
+fn host_allowed(host: Option<&str>, port: u16, extra: &[String]) -> bool {
     let allowed = [
         format!("localhost:{port}"),
         format!("127.0.0.1:{port}"),
         format!("[::1]:{port}"),
     ];
-    host.is_some_and(|h| allowed.iter().any(|a| a == h))
+    host.is_some_and(|h| allowed.iter().any(|a| a == h) || extra.iter().any(|e| host_matches(e, h)))
 }
 
-fn mutation_ok(req: &Request) -> bool {
+/// `name` matches exactly; `.suffix` matches any name under it (a whole tailnet, say).
+/// Ports never match: proxies in front of portmap present their names without one.
+fn host_matches(pattern: &str, host: &str) -> bool {
+    let (pattern, host) = (pattern.to_ascii_lowercase(), host.to_ascii_lowercase());
+    if pattern.starts_with('.') {
+        host.len() > pattern.len() && host.ends_with(&pattern) && !host.contains(':')
+    } else {
+        host == pattern
+    }
+}
+
+fn mutation_ok(req: &Request, extra: &[String]) -> bool {
     mutation_allowed(
         req_header(req, "Content-Type"),
         req_header(req, "Origin"),
         req_header(req, "Host"),
+        extra,
     )
 }
 
 /// Mutations must come from our own page: JSON content type (forces a CORS preflight
-/// for cross-origin pages) and, when present, a matching Origin.
-fn mutation_allowed(content_type: Option<&str>, origin: Option<&str>, host: Option<&str>) -> bool {
+/// for cross-origin pages) and, when present, a matching Origin. An opted-in host is
+/// typically fronted by HTTPS, so its Origin may be `https://` as well.
+fn mutation_allowed(
+    content_type: Option<&str>,
+    origin: Option<&str>,
+    host: Option<&str>,
+    extra: &[String],
+) -> bool {
     let json = content_type.is_some_and(|c| c.starts_with("application/json"));
     let origin_ok = match (origin, host) {
-        (Some(o), Some(h)) => o == format!("http://{h}"),
+        (Some(o), Some(h)) => {
+            o == format!("http://{h}")
+                || (extra.iter().any(|e| host_matches(e, h)) && o == format!("https://{h}"))
+        }
         (None, _) => true,
         _ => false,
     };
@@ -89,11 +113,26 @@ fn mutation_allowed(content_type: Option<&str>, origin: Option<&str>, host: Opti
 }
 
 fn state_body(store: &Store, thumbs: bool, stale_minutes: u64) -> Vec<u8> {
+    let tailnet = serde_json::to_string(&store.tailnet.as_ref().map(|t| &t.host))
+        .unwrap_or_else(|_| "null".into());
     format!(
-        r#"{{"version":{},"scanned_at":{},"thumbs":{},"stale_minutes":{},"services":{}}}"#,
-        store.version, store.scanned_at, thumbs, stale_minutes, store.view_json
+        r#"{{"version":{},"scanned_at":{},"thumbs":{},"stale_minutes":{},"tailnet":{},"services":{}}}"#,
+        store.version, store.scanned_at, thumbs, stale_minutes, tailnet, store.view_json
     )
     .into_bytes()
+}
+
+/// Opted-in names plus this machine's tailnet name and any name under the tailnet's MagicDNS
+/// suffix (a Tailscale sidecar proxying to portmap is its own node), which `tailscale serve`
+/// passes through as the Host. Only nodes in the user's tailnet get those names, so they
+/// can't be a rebinding vector.
+fn extra_hosts(shared: &Shared) -> Vec<String> {
+    let mut hosts = shared.cfg.allowed_hosts.clone();
+    if let Some(t) = &shared.store.lock().unwrap().tailnet {
+        hosts.push(t.host.clone());
+        hosts.extend(t.suffix.as_ref().map(|s| format!(".{s}")));
+    }
+    hosts
 }
 
 fn send_state(req: Request, shared: &Shared) {
@@ -129,7 +168,8 @@ struct Action {
 }
 
 fn handle(mut req: Request, shared: &Shared) {
-    if !host_ok(&req, shared.cfg.port) {
+    let extra = extra_hosts(shared);
+    if !host_ok(&req, shared.cfg.port, &extra) {
         return send(req, 403, "text/plain", b"forbidden host".to_vec(), &[]);
     }
     let url = req.url().to_string();
@@ -195,7 +235,7 @@ fn handle(mut req: Request, shared: &Shared) {
             }
         }
         (Method::Post, "/api/refresh") => {
-            if !mutation_ok(&req) {
+            if !mutation_ok(&req, &extra) {
                 return send(req, 403, "text/plain", b"forbidden".to_vec(), &[]);
             }
             let (tx, rx) = mpsc::channel();
@@ -207,7 +247,7 @@ fn handle(mut req: Request, shared: &Shared) {
             send_state(req, shared);
         }
         (Method::Post, "/api/action") => {
-            if !mutation_ok(&req) {
+            if !mutation_ok(&req, &extra) {
                 return send(req, 403, "text/plain", b"forbidden".to_vec(), &[]);
             }
             let mut body = String::new();
@@ -215,9 +255,27 @@ fn handle(mut req: Request, shared: &Shared) {
             let Ok(action) = serde_json::from_str::<Action>(&body) else {
                 return send(req, 400, "text/plain", b"bad request".to_vec(), &[]);
             };
-            match apply(shared, action) {
+            let result = if action.op == "share" {
+                // Read the owner in its own statement: `share` takes the store lock again.
+                let owner = shared
+                    .store
+                    .lock()
+                    .unwrap()
+                    .tailnet
+                    .as_ref()
+                    .and_then(|t| t.owner.clone());
+                share_allowed(
+                    req_header(&req, "X-Forwarded-For"),
+                    req_header(&req, "Tailscale-User-Login"),
+                    owner.as_deref(),
+                )
+                .and_then(|()| share(shared, action))
+            } else {
+                apply(shared, action).map_err(String::from)
+            };
+            match result {
                 Ok(()) => send_state(req, shared),
-                Err(msg) => send(req, 400, "text/plain", msg.into(), &[]),
+                Err(msg) => send(req, 400, "text/plain", msg.into_bytes(), &[]),
             }
         }
         (Method::Get, p) if p.starts_with("/thumb/") => {
@@ -237,6 +295,73 @@ fn handle(mut req: Request, shared: &Shared) {
         }
         _ => send(req, 404, "text/plain", b"not found".to_vec(), &[]),
     }
+}
+
+/// Sharing widens what the tailnet can reach, so beyond the usual mutation checks it needs a
+/// direct local request or the node owner's identity. `tailscale serve` always adds
+/// `X-Forwarded-For` and overwrites any client-sent `Tailscale-User-Login`; the Host header
+/// can't be used, since a proxied client chooses it freely.
+fn share_allowed(
+    forwarded_for: Option<&str>,
+    login: Option<&str>,
+    owner: Option<&str>,
+) -> Result<(), String> {
+    let proxied = forwarded_for.is_some() || login.is_some();
+    if !proxied || (login.is_some() && login == owner) {
+        Ok(())
+    } else {
+        Err("only this machine or its tailnet owner can share services".into())
+    }
+}
+
+/// Adds or removes a tailnet-only `tailscale serve` mapping for a loopback-bound service.
+/// Decides from freshly read Tailscale state and runs the CLI without holding the store lock.
+fn share(shared: &Shared, a: Action) -> Result<(), String> {
+    let cli = shared
+        .cfg
+        .tailscale
+        .as_deref()
+        .ok_or("tailscale CLI not found")?;
+    let port = a.port.ok_or("missing port")?;
+    let on = a.value.as_ref().and_then(|v| v.as_bool()).unwrap_or(true);
+    let (addrs, listening) = {
+        let store = shared.store.lock().unwrap();
+        let e = store
+            .entries
+            .get(&port)
+            .filter(|e| e.http)
+            .ok_or("unknown port")?;
+        (e.addrs.clone(), e.listening)
+    };
+    let started = Instant::now();
+    let tn = tailnet::detect(cli)?.ok_or("not connected to a tailnet")?;
+    match (on, tn.serve_for(port)) {
+        (true, Some(_)) | (false, None) => {}
+        (false, Some(s)) if !s.owned => {
+            return Err(format!(
+                "tailnet port {} wasn't shared by portmap; remove it with `tailscale serve`",
+                s.port
+            ))
+        }
+        (true, None) => {
+            if !listening {
+                return Err("service is not running".into());
+            }
+            if tn.reaches(&addrs) {
+                return Err("already reachable on the tailnet".into());
+            }
+            if tn.serve_on(port).is_some() {
+                return Err(format!(
+                    "tailnet port {port} is already used by tailscale serve"
+                ));
+            }
+            tailnet::share(cli, port)?;
+        }
+        (false, Some(s)) => tailnet::unshare(cli, s)?,
+    }
+    scanner::set_tailnet(shared, started, tailnet::detect(cli));
+    shared.store.lock().unwrap().refresh_view();
+    Ok(())
 }
 
 fn apply(shared: &Shared, a: Action) -> Result<(), &'static str> {
@@ -354,34 +479,232 @@ mod tests {
 
     #[test]
     fn host_guard_blocks_dns_rebinding() {
-        assert!(host_allowed(Some("localhost:7878"), 7878));
-        assert!(host_allowed(Some("127.0.0.1:7878"), 7878));
-        assert!(host_allowed(Some("[::1]:7878"), 7878));
-        assert!(!host_allowed(Some("localhost:7879"), 7878));
-        assert!(!host_allowed(Some("evil.example:7878"), 7878));
-        assert!(!host_allowed(Some("localhost"), 7878));
-        assert!(!host_allowed(None, 7878));
+        assert!(host_allowed(Some("localhost:7878"), 7878, &[]));
+        assert!(host_allowed(Some("127.0.0.1:7878"), 7878, &[]));
+        assert!(host_allowed(Some("[::1]:7878"), 7878, &[]));
+        assert!(!host_allowed(Some("localhost:7879"), 7878, &[]));
+        assert!(!host_allowed(Some("evil.example:7878"), 7878, &[]));
+        assert!(!host_allowed(Some("localhost"), 7878, &[]));
+        assert!(!host_allowed(None, 7878, &[]));
+    }
+
+    #[test]
+    fn host_guard_accepts_only_opted_in_extra_hosts() {
+        let extra = vec!["box.tail1234.ts.net".to_string()];
+        assert!(host_allowed(Some("box.tail1234.ts.net"), 7878, &extra));
+        assert!(host_allowed(Some("BOX.tail1234.ts.net"), 7878, &extra));
+        assert!(!host_allowed(Some("box.tail1234.ts.net"), 7878, &[]));
+        assert!(!host_allowed(Some("evil.example"), 7878, &extra));
+        assert!(!host_allowed(Some("sub.box.tail1234.ts.net"), 7878, &extra));
+        assert!(host_allowed(Some("localhost:7878"), 7878, &extra));
+    }
+
+    #[test]
+    fn host_guard_accepts_a_whole_tailnet_by_suffix() {
+        let extra = vec![".tail1234.ts.net".to_string()];
+        assert!(host_allowed(Some("portmap.tail1234.ts.net"), 7878, &extra));
+        assert!(host_allowed(Some("Box.Tail1234.ts.net"), 7878, &extra));
+        assert!(!host_allowed(Some("tail1234.ts.net"), 7878, &extra));
+        assert!(!host_allowed(Some(".tail1234.ts.net"), 7878, &extra));
+        assert!(!host_allowed(Some("eviltail1234.ts.net"), 7878, &extra));
+        assert!(!host_allowed(
+            Some("box.tail1234.ts.net.evil.example"),
+            7878,
+            &extra
+        ));
+        assert!(!host_allowed(
+            Some("box.tail1234.ts.net:7878"),
+            7878,
+            &extra
+        ));
+        assert!(mutation_allowed(
+            Some("application/json"),
+            Some("https://portmap.tail1234.ts.net"),
+            Some("portmap.tail1234.ts.net"),
+            &extra
+        ));
     }
 
     #[test]
     fn mutation_guard_requires_json_and_same_origin() {
         let json = Some("application/json");
         let host = Some("localhost:7878");
-        assert!(mutation_allowed(json, None, host));
+        assert!(mutation_allowed(json, None, host, &[]));
         assert!(mutation_allowed(
             Some("application/json; charset=utf-8"),
             Some("http://localhost:7878"),
-            host
+            host,
+            &[]
         ));
-        assert!(!mutation_allowed(Some("text/plain"), None, host));
-        assert!(!mutation_allowed(None, None, host));
-        assert!(!mutation_allowed(json, Some("http://evil.example"), host));
+        assert!(!mutation_allowed(Some("text/plain"), None, host, &[]));
+        assert!(!mutation_allowed(None, None, host, &[]));
+        assert!(!mutation_allowed(
+            json,
+            Some("http://evil.example"),
+            host,
+            &[]
+        ));
         assert!(!mutation_allowed(
             json,
             Some("https://localhost:7878"),
-            host
+            host,
+            &[]
         ));
-        assert!(!mutation_allowed(json, Some("http://localhost:7878"), None));
+        assert!(!mutation_allowed(
+            json,
+            Some("http://localhost:7878"),
+            None,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn mutation_guard_allows_https_origin_only_for_extra_hosts() {
+        let json = Some("application/json");
+        let extra = vec!["box.tail1234.ts.net".to_string()];
+        let host = Some("box.tail1234.ts.net");
+        assert!(mutation_allowed(
+            json,
+            Some("https://box.tail1234.ts.net"),
+            host,
+            &extra
+        ));
+        assert!(!mutation_allowed(
+            json,
+            Some("https://box.tail1234.ts.net"),
+            host,
+            &[]
+        ));
+        assert!(!mutation_allowed(
+            json,
+            Some("https://evil.example"),
+            host,
+            &extra
+        ));
+    }
+
+    /// A stand-in `tailscale` CLI: logs each call and keeps serve config in a file.
+    const FAKE_TAILSCALE: &str = r#"#!/bin/sh
+d="$(dirname "$0")"
+echo "$*" >> "$d/calls"
+case "$*" in
+  "status --json") echo '{"BackendState":"Running","Self":{"DNSName":"box.tail1234.ts.net.","TailscaleIPs":["100.64.0.7"],"UserID":1},"User":{"1":{"LoginName":"me@example.com"}}}' ;;
+  "serve status --json") cat "$d/serve.json" 2>/dev/null || echo '{}' ;;
+  "serve --bg --https=3000 http://localhost:3000") echo '{"TCP":{"3000":{"HTTPS":true}},"Web":{"box.tail1234.ts.net:3000":{"Handlers":{"/":{"Proxy":"http://localhost:3000"}}}}}' > "$d/serve.json" ;;
+  "serve --https=3000 off") echo '{}' > "$d/serve.json" ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+"#;
+
+    fn view_of(h: &Harness, port: u16) -> Value {
+        let store = h.shared.store.lock().unwrap();
+        let v: Vec<Value> = serde_json::from_str(&store.view_json).unwrap();
+        v.into_iter().find(|s| s["port"] == port).unwrap()
+    }
+
+    #[test]
+    fn share_toggles_a_tailscale_serve_mapping() {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = crate::testutil::TempDir::new();
+        let cli = bin.path().join("tailscale");
+        std::fs::write(&cli, FAKE_TAILSCALE).unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (h, client) = live_with(None, Some(cli.clone()));
+        let at = |port, addr: &str| Entry {
+            addrs: vec![addr.into()],
+            ..web(port)
+        };
+        {
+            let mut store = h.shared.store.lock().unwrap();
+            for e in [at(3000, "127.0.0.1"), at(4000, "*")] {
+                store.entries.insert(e.port, e);
+            }
+        }
+        // Over real HTTP, the way the page and `tailscale serve` reach it.
+        let share_as = |port: u16, on: bool, via: &[(&str, &str)]| {
+            let mut headers = vec![("Content-Type", "application/json")];
+            headers.extend_from_slice(via);
+            let body = json!({"op": "share", "port": port, "value": on}).to_string();
+            let r = client.raw("POST", "/api/action", &client.host(), &headers, &body);
+            match r.status {
+                200 => Ok(()),
+                _ => Err(String::from_utf8_lossy(&r.body).to_string()),
+            }
+        };
+        let share_op = |port, on| share_as(port, on, &[]);
+
+        scanner::set_tailnet(&h.shared, Instant::now(), tailnet::detect(&cli));
+        h.shared.store.lock().unwrap().refresh_view();
+        assert_eq!(view_of(&h, 3000)["tailnet"], "local");
+        assert!(view_of(&h, 3000).get("remote_url").is_none());
+        assert_eq!(view_of(&h, 4000)["tailnet"], "direct");
+        assert_eq!(
+            view_of(&h, 4000)["remote_url"],
+            "http://box.tail1234.ts.net:4000/"
+        );
+        assert!(extra_hosts(&h.shared).contains(&"box.tail1234.ts.net".to_string()));
+
+        let peer = [
+            ("X-Forwarded-For", "100.64.0.9"),
+            ("Tailscale-User-Login", "guest@example.com"),
+        ];
+        assert_eq!(
+            share_as(3000, true, &peer).unwrap_err(),
+            "only this machine or its tailnet owner can share services"
+        );
+        let owner = [
+            ("X-Forwarded-For", "100.64.0.7"),
+            ("Tailscale-User-Login", "me@example.com"),
+        ];
+        share_as(3000, true, &owner).unwrap();
+        assert_eq!(view_of(&h, 3000)["tailnet"], "shared");
+        assert_eq!(
+            view_of(&h, 3000)["remote_url"],
+            "https://box.tail1234.ts.net:3000/"
+        );
+        share_op(3000, true).unwrap();
+        assert_eq!(
+            share_op(4000, true).unwrap_err(),
+            "already reachable on the tailnet"
+        );
+        assert_eq!(share_op(9, true).unwrap_err(), "unknown port");
+
+        share_op(3000, false).unwrap();
+        assert_eq!(view_of(&h, 3000)["tailnet"], "local");
+        let calls = std::fs::read_to_string(bin.path().join("calls")).unwrap();
+        let mutations: Vec<&str> = calls.lines().filter(|l| !l.ends_with("--json")).collect();
+        assert_eq!(
+            mutations,
+            [
+                "serve --bg --https=3000 http://localhost:3000",
+                "serve --https=3000 off"
+            ],
+            "sharing twice runs tailscale once"
+        );
+    }
+
+    #[test]
+    fn share_from_the_tailnet_needs_the_owner_identity() {
+        let owner = Some("me@example.com");
+        assert!(
+            share_allowed(None, None, owner).is_ok(),
+            "direct local request"
+        );
+        assert!(share_allowed(Some("100.64.0.9"), owner, owner).is_ok());
+        assert!(share_allowed(Some("100.64.0.9"), Some("guest@example.com"), owner).is_err());
+        assert!(
+            share_allowed(Some("100.64.0.9"), None, owner).is_err(),
+            "tagged or shared-in peer"
+        );
+        assert!(share_allowed(Some("100.64.0.9"), owner, None).is_err());
+    }
+
+    #[test]
+    fn share_needs_tailscale() {
+        let h = with_entries(None, vec![web(3000)]);
+        let a = serde_json::from_value(json!({"op": "share", "port": 3000})).unwrap();
+        assert_eq!(share(&h.shared, a).unwrap_err(), "tailscale CLI not found");
+        assert!(view_of(&h, 3000).get("tailnet").is_none());
     }
 
     #[test]
@@ -536,9 +859,13 @@ mod tests {
     }
 
     fn live(browser: Option<PathBuf>) -> (Harness, Client) {
+        live_with(browser, None)
+    }
+
+    fn live_with(browser: Option<PathBuf>, tailscale: Option<PathBuf>) -> (Harness, Client) {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = server.server_addr().to_ip().unwrap().port();
-        let h = harness(port, browser);
+        let h = crate::testutil::harness_with_tailscale(port, browser, tailscale);
         let shared = h.shared.clone();
         thread::spawn(move || serve(server, shared));
         (h, Client { port })

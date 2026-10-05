@@ -21,6 +21,15 @@ let failing = false;
 let firstPaint = true;
 let editing = null;
 let thumbsEnabled = true;
+let tailnet = null;
+
+// Opened from another device (e.g. over Tailscale), localhost would mean that device, so
+// links use the tailnet address the server worked out for each service.
+// A loopback-only service has no such address; linking to localhost there would open
+// whatever happens to run on the viewer's own device, so it gets no link until shared.
+const remoteView = !['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
+const hrefOf = (s) => (remoteView ? s.remote_url || (s.tailnet ? null : s.url) : s.url);
+const sharing = new Set();
 
 const BADGE = { live: 'live', error: 'error', stale: 'stopped', offline: 'offline', other: 'running' };
 
@@ -65,8 +74,11 @@ function patchCard(el, s) {
   el.classList.toggle('gone', gone);
   el.classList.toggle('pinned', s.pinned);
   const hit = $('.hit', el);
-  if (hit.getAttribute('href') !== s.url) hit.href = s.url;
+  const href = hrefOf(s);
+  if (!href) hit.removeAttribute('href');
+  else if (hit.getAttribute('href') !== href) hit.href = href;
   hit.setAttribute('aria-label', `Open ${s.name} on port ${s.port}`);
+  hit.title = remoteView && s.tailnet === 'local' ? 'Only reachable on the host machine. Share it on the tailnet first.' : '';
 
   if (editing !== s.port) setText($('.name', el), s.name);
   const subtitle = s.title && s.title !== s.name ? s.title : (s.project && s.project !== s.name ? s.project : '');
@@ -100,6 +112,13 @@ function patchCard(el, s) {
   $('[data-op=recapture]', el).hidden = gone || !thumbsEnabled;
   $('[data-op=forget]', el).hidden = !gone;
   $('[data-op=hide]', el).hidden = gone;
+
+  const share = $('[data-op=share]', el);
+  const shared = s.tailnet === 'shared';
+  share.hidden = !tailnet || !(shared || (s.tailnet === 'local' && !gone));
+  share.classList.toggle('on', shared);
+  share.disabled = sharing.has(s.port);
+  share.title = shared ? `Stop sharing on tailnet (${s.remote_url})` : `Share on tailnet (${tailnet})`;
 }
 
 function rowFor(s, kind) {
@@ -120,9 +139,9 @@ function rowFor(s, kind) {
   if (kind === 'hidden') {
     li.append(button('Unhide', () => act('hide', s.port, false)));
   } else {
-    if (s.status) {
+    if (s.status && hrefOf(s)) {
       const a = document.createElement('a');
-      a.href = s.url;
+      a.href = hrefOf(s);
       a.target = '_blank';
       a.rel = 'noopener';
       a.textContent = 'Open';
@@ -210,6 +229,7 @@ function apply(state) {
   services = state.services;
   scannedAt = state.scanned_at || scannedAt;
   thumbsEnabled = state.thumbs;
+  tailnet = state.tailnet;
   setText($('#foot-note'),
     `Updates every 3s while this tab is visible. Stopped services clear after ${state.stale_minutes} min unless pinned.` +
     (state.thumbs ? '' : ' Thumbnails are off (no Chromium-family browser found).'));
@@ -253,7 +273,21 @@ async function post(path, body) {
 }
 
 async function act(op, port, value) {
-  try { await post('/api/action', { op, port, value }); } catch (e) { console.warn(op, e); }
+  // Sharing shells out to Tailscale and can take seconds; ignore repeat clicks meanwhile.
+  if (op === 'share') {
+    if (sharing.has(port)) return;
+    sharing.add(port);
+    render();
+  }
+  try {
+    await post('/api/action', { op, port, value });
+  } catch (e) {
+    console.warn(op, e);
+    // Sharing shells out to Tailscale and can fail for reasons worth showing.
+    if (op === 'share') setText($('#status-text'), `tailnet: ${e.message}`);
+  } finally {
+    if (sharing.delete(port)) render();
+  }
 }
 
 async function refresh() {
@@ -278,6 +312,7 @@ function onAction(ev) {
   else if (op === 'hide') act('hide', port, true);
   else if (op === 'forget') act('forget', port);
   else if (op === 'recapture') act('recapture', port);
+  else if (op === 'share') act('share', port, s.tailnet !== 'shared');
   else if (op === 'rename') startRename(btn.closest('.card'), s);
 }
 
@@ -428,7 +463,8 @@ $('#q').addEventListener('keydown', (e) => {
   if (e.key === 'Escape') { e.target.value = ''; applyFilter(); e.target.blur(); }
   if (e.key === 'Enter') {
     const first = [...document.querySelectorAll('.grid .card')].find((c) => !c.hidden);
-    if (first) window.open($('.hit', first).href, '_blank', 'noopener');
+    const href = first && $('.hit', first).getAttribute('href');
+    if (href) window.open(href, '_blank', 'noopener');
   }
 });
 document.addEventListener('keydown', (e) => {

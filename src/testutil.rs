@@ -47,6 +47,14 @@ pub struct Harness {
 }
 
 pub fn harness(port: u16, browser: Option<PathBuf>) -> Harness {
+    harness_with_tailscale(port, browser, None)
+}
+
+pub fn harness_with_tailscale(
+    port: u16,
+    browser: Option<PathBuf>,
+    tailscale: Option<PathBuf>,
+) -> Harness {
     let dir = TempDir::new();
     let (scan_tx, scan_rx) = mpsc::channel();
     let (thumb_tx, thumb_rx) = mpsc::channel();
@@ -57,6 +65,8 @@ pub fn harness(port: u16, browser: Option<PathBuf>) -> Harness {
             data_dir: dir.path().to_path_buf(),
             stale_secs: 600,
             browser,
+            allowed_hosts: Vec::new(),
+            tailscale,
         },
         scan_tx,
         thumb_tx,

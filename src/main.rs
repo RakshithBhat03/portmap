@@ -3,6 +3,7 @@ mod scan;
 mod scanner;
 mod server;
 mod store;
+mod tailnet;
 #[cfg(test)]
 mod testutil;
 mod thumbs;
@@ -17,6 +18,10 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub stale_secs: u64,
     pub browser: Option<PathBuf>,
+    /// Extra `Host` values accepted besides loopback (e.g. a Tailscale Serve name).
+    pub allowed_hosts: Vec<String>,
+    /// `tailscale` CLI, when installed; used to find this machine's tailnet links.
+    pub tailscale: Option<PathBuf>,
 }
 
 pub struct Shared {
@@ -39,7 +44,9 @@ ENV:
   PORTMAP_HOME            data directory (~/.portmap)
   PORTMAP_STALE_MINUTES   how long stopped services linger before clearing (10)
   PORTMAP_BROWSER         Chromium-family binary used for thumbnails (auto-detected)
-  PORTMAP_NO_THUMBS=1     disable thumbnails";
+  PORTMAP_NO_THUMBS=1     disable thumbnails
+  PORTMAP_ALLOWED_HOSTS   comma-separated extra Host names to accept (e.g. a tailscale serve name)
+  PORTMAP_TAILSCALE       tailscale CLI path, or `off` to disable tailnet links (auto-detected)";
 
 fn main() {
     let env_port: u16 = std::env::var("PORTMAP_PORT")
@@ -114,6 +121,10 @@ fn serve(port: u16, data_dir: PathBuf) -> Result<(), String> {
         Some(b) => eprintln!("thumbnails via {}", b.display()),
         None => eprintln!("no Chromium-family browser found; thumbnails disabled"),
     }
+    let tailscale = tailnet::find_cli();
+    if let Some(t) = &tailscale {
+        eprintln!("tailnet links via {}", t.display());
+    }
     let (scan_tx, scan_rx) = mpsc::channel();
     let (thumb_tx, thumb_rx) = mpsc::channel();
     let shared = Arc::new(Shared {
@@ -123,6 +134,15 @@ fn serve(port: u16, data_dir: PathBuf) -> Result<(), String> {
             data_dir,
             stale_secs: stale_minutes * 60,
             browser,
+            allowed_hosts: std::env::var("PORTMAP_ALLOWED_HOSTS")
+                .map(|v| {
+                    v.split(',')
+                        .map(|h| h.trim().to_string())
+                        .filter(|h| !h.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            tailscale,
         },
         scan_tx,
         thumb_tx,
