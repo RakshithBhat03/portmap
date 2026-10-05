@@ -2,7 +2,7 @@
 //! runs at reduced CPU priority. No root, no Docker.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const LABEL: &str = "dev.portmap";
@@ -26,14 +26,8 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-pub fn install(port: u16, data_dir: &std::path::Path) -> Result<(), String> {
-    if !cfg!(target_os = "macos") {
-        return Err("`install` uses launchd and is macOS-only; on Linux run `portmap serve` from a systemd user unit".into());
-    }
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let exe = exe.canonicalize().unwrap_or(exe);
-    let log = data_dir.join("portmap.log");
-    let plist = format!(
+fn plist(exe: &Path, port: u16, log: &Path) -> String {
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -58,7 +52,17 @@ pub fn install(port: u16, data_dir: &std::path::Path) -> Result<(), String> {
 "#,
         exe = xml_escape(&exe.to_string_lossy()),
         log = xml_escape(&log.to_string_lossy()),
-    );
+    )
+}
+
+pub fn install(port: u16, data_dir: &Path) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Err("`install` uses launchd and is macOS-only; on Linux run `portmap serve` from a systemd user unit".into());
+    }
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+    let log = data_dir.join("portmap.log");
+    let plist = plist(&exe, port, &log);
     let path = plist_path();
     fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
     // Reinstall cleanly if already loaded (e.g. after upgrading the binary).
@@ -94,4 +98,44 @@ pub fn uninstall() -> Result<(), String> {
     }
     println!("Removed launchd agent {LABEL}. Data in ~/.portmap was kept.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escapes_xml_metacharacters() {
+        assert_eq!(xml_escape("a&b<c>d"), "a&amp;b&lt;c&gt;d");
+        assert_eq!(xml_escape("plain"), "plain");
+    }
+
+    #[test]
+    fn plist_runs_serve_on_the_requested_port() {
+        let xml = plist(
+            Path::new("/Users/x/bin/portmap"),
+            9123,
+            Path::new("/Users/x/.portmap/portmap.log"),
+        );
+        assert!(xml.starts_with("<?xml"));
+        assert!(xml.contains("<key>Label</key><string>dev.portmap</string>"));
+        assert!(xml.contains(
+            "<string>/Users/x/bin/portmap</string>\n    <string>serve</string>\n    <string>--port</string>\n    <string>9123</string>"
+        ));
+        assert!(xml.contains("<key>KeepAlive</key><true/>"));
+        assert!(xml
+            .contains("<key>StandardOutPath</key><string>/Users/x/.portmap/portmap.log</string>"));
+    }
+
+    #[test]
+    fn plist_escapes_paths() {
+        let xml = plist(
+            Path::new("/tmp/R&D <dev>/portmap"),
+            7878,
+            Path::new("/tmp/a&b.log"),
+        );
+        assert!(xml.contains("<string>/tmp/R&amp;D &lt;dev&gt;/portmap</string>"));
+        assert!(xml.contains("<string>/tmp/a&amp;b.log</string>"));
+        assert!(!xml.contains("R&D"));
+    }
 }

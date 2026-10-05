@@ -3,6 +3,8 @@ mod scan;
 mod scanner;
 mod server;
 mod store;
+#[cfg(test)]
+mod testutil;
 mod thumbs;
 
 use std::path::PathBuf;
@@ -40,18 +42,12 @@ ENV:
   PORTMAP_NO_THUMBS=1     disable thumbnails";
 
 fn main() {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let mut port: u16 = std::env::var("PORTMAP_PORT")
+    let env_port: u16 = std::env::var("PORTMAP_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(7878);
-    if let Some(i) = args.iter().position(|a| a == "--port" || a == "-p") {
-        match args.get(i + 1).and_then(|p| p.parse().ok()) {
-            Some(p) => port = p,
-            None => fail("--port needs a number"),
-        }
-        args.drain(i..=i + 1);
-    }
+    let (port, args) =
+        parse_args(std::env::args().skip(1).collect(), env_port).unwrap_or_else(|e| fail(&e));
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()));
     let data_dir = std::env::var("PORTMAP_HOME")
         .map(PathBuf::from)
@@ -86,6 +82,19 @@ fn main() {
     if let Err(e) = result {
         fail(&e);
     }
+}
+
+/// Pulls `--port N` / `-p N` out of argv; what remains is the subcommand.
+fn parse_args(mut args: Vec<String>, default_port: u16) -> Result<(u16, Vec<String>), String> {
+    let mut port = default_port;
+    if let Some(i) = args.iter().position(|a| a == "--port" || a == "-p") {
+        port = args
+            .get(i + 1)
+            .and_then(|p| p.parse().ok())
+            .ok_or("--port needs a number")?;
+        args.drain(i..=i + 1);
+    }
+    Ok((port, args))
 }
 
 fn fail(msg: &str) -> ! {
@@ -135,4 +144,37 @@ fn serve(port: u16, data_dir: PathBuf) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     server::run(shared)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args;
+
+    fn argv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_args_uses_default_port() {
+        assert_eq!(parse_args(vec![], 7878), Ok((7878, vec![])));
+    }
+
+    #[test]
+    fn port_flag_overrides_default_and_is_removed() {
+        assert_eq!(
+            parse_args(argv(&["serve", "--port", "9000"]), 7878),
+            Ok((9000, argv(&["serve"])))
+        );
+        assert_eq!(
+            parse_args(argv(&["-p", "1234", "install"]), 7878),
+            Ok((1234, argv(&["install"])))
+        );
+    }
+
+    #[test]
+    fn port_flag_needs_a_valid_number() {
+        assert!(parse_args(argv(&["--port"]), 7878).is_err());
+        assert!(parse_args(argv(&["--port", "abc"]), 7878).is_err());
+        assert!(parse_args(argv(&["--port", "70000"]), 7878).is_err());
+    }
 }
