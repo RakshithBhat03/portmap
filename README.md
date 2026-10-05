@@ -35,6 +35,20 @@ to click through. It lives at **http://localhost:7878**.
 
 ## Install (macOS)
 
+### Homebrew
+
+```sh
+brew install rakshithbhat03/tap/portmap
+brew services start portmap   # starts at login, restarts on crash
+open http://localhost:7878
+```
+
+After `brew upgrade portmap`, run `brew services restart portmap`. Logs go to
+`$(brew --prefix)/var/log/portmap.log`. Use either `brew services` or `portmap install` below, not
+both; they would compete for the same port.
+
+### From source
+
 ```sh
 cargo install --path .     # builds and puts `portmap` in ~/.cargo/bin
 portmap install            # launchd user agent: starts at login, restarts on crash
