@@ -98,3 +98,17 @@ src/server.rs    HTTP API + static UI, host/origin guards
 src/launchd.rs   install / uninstall the user agent
 assets/          index.html, style.css, app.js (no build step, embedded into the binary)
 ```
+
+## Development
+
+```bash
+cargo test                                  # ~1s, no network or browser needed
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
+
+Tests live next to the code they cover (`#[cfg(test)] mod tests` in each file). Probes and the HTTP
+API are exercised against real sockets on ephemeral loopback ports, thumbnail capture against a stub
+"browser" script, and persistence against throwaway directories; shared fixtures are in
+`src/testutil.rs`. Nothing touches `~/.portmap` or probes the services running on your machine.
+CI runs the same three commands on every pull request.

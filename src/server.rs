@@ -22,11 +22,15 @@ pub fn run(shared: Arc<Shared>) -> Result<(), String> {
     let server = tiny_http::Server::http(addr)
         .map_err(|e| format!("cannot bind 127.0.0.1:{}: {e}", shared.cfg.port))?;
     eprintln!("portmap listening on http://localhost:{}", shared.cfg.port);
+    serve(server, shared);
+    Ok(())
+}
+
+fn serve(server: tiny_http::Server, shared: Arc<Shared>) {
     for req in server.incoming_requests() {
         let shared = shared.clone();
         thread::spawn(move || handle(req, &shared));
     }
-    Ok(())
 }
 
 fn header(k: &str, v: &str) -> Header {
@@ -52,19 +56,31 @@ fn req_header<'a>(req: &'a Request, name: &'static str) -> Option<&'a str> {
 }
 
 fn host_ok(req: &Request, port: u16) -> bool {
+    host_allowed(req_header(req, "Host"), port)
+}
+
+fn host_allowed(host: Option<&str>, port: u16) -> bool {
     let allowed = [
         format!("localhost:{port}"),
         format!("127.0.0.1:{port}"),
         format!("[::1]:{port}"),
     ];
-    req_header(req, "Host").is_some_and(|h| allowed.iter().any(|a| a == h))
+    host.is_some_and(|h| allowed.iter().any(|a| a == h))
+}
+
+fn mutation_ok(req: &Request) -> bool {
+    mutation_allowed(
+        req_header(req, "Content-Type"),
+        req_header(req, "Origin"),
+        req_header(req, "Host"),
+    )
 }
 
 /// Mutations must come from our own page: JSON content type (forces a CORS preflight
 /// for cross-origin pages) and, when present, a matching Origin.
-fn mutation_ok(req: &Request) -> bool {
-    let json = req_header(req, "Content-Type").is_some_and(|c| c.starts_with("application/json"));
-    let origin_ok = match (req_header(req, "Origin"), req_header(req, "Host")) {
+fn mutation_allowed(content_type: Option<&str>, origin: Option<&str>, host: Option<&str>) -> bool {
+    let json = content_type.is_some_and(|c| c.starts_with("application/json"));
+    let origin_ok = match (origin, host) {
         (Some(o), Some(h)) => o == format!("http://{h}"),
         (None, _) => true,
         _ => false,
@@ -294,4 +310,475 @@ fn apply(shared: &Shared, a: Action) -> Result<(), &'static str> {
     store.refresh_view();
     store.save();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Entry;
+    use crate::testutil::{harness, Harness};
+    use serde_json::{json, Value};
+    use std::io::Write;
+    use std::net::TcpStream;
+    use std::path::PathBuf;
+
+    fn web(port: u16) -> Entry {
+        Entry {
+            port,
+            listening: true,
+            http: true,
+            status: 200,
+            ..Default::default()
+        }
+    }
+
+    fn act(h: &Harness, a: Value) -> Result<(), &'static str> {
+        apply(&h.shared, serde_json::from_value(a).unwrap())
+    }
+
+    fn entry(h: &Harness, port: u16) -> Option<Entry> {
+        h.shared.store.lock().unwrap().entries.get(&port).cloned()
+    }
+
+    fn with_entries(browser: Option<PathBuf>, entries: Vec<Entry>) -> Harness {
+        let h = harness(1, browser);
+        {
+            let mut store = h.shared.store.lock().unwrap();
+            for e in entries {
+                store.entries.insert(e.port, e);
+            }
+            store.refresh_view();
+        }
+        h
+    }
+
+    #[test]
+    fn host_guard_blocks_dns_rebinding() {
+        assert!(host_allowed(Some("localhost:7878"), 7878));
+        assert!(host_allowed(Some("127.0.0.1:7878"), 7878));
+        assert!(host_allowed(Some("[::1]:7878"), 7878));
+        assert!(!host_allowed(Some("localhost:7879"), 7878));
+        assert!(!host_allowed(Some("evil.example:7878"), 7878));
+        assert!(!host_allowed(Some("localhost"), 7878));
+        assert!(!host_allowed(None, 7878));
+    }
+
+    #[test]
+    fn mutation_guard_requires_json_and_same_origin() {
+        let json = Some("application/json");
+        let host = Some("localhost:7878");
+        assert!(mutation_allowed(json, None, host));
+        assert!(mutation_allowed(
+            Some("application/json; charset=utf-8"),
+            Some("http://localhost:7878"),
+            host
+        ));
+        assert!(!mutation_allowed(Some("text/plain"), None, host));
+        assert!(!mutation_allowed(None, None, host));
+        assert!(!mutation_allowed(json, Some("http://evil.example"), host));
+        assert!(!mutation_allowed(
+            json,
+            Some("https://localhost:7878"),
+            host
+        ));
+        assert!(!mutation_allowed(json, Some("http://localhost:7878"), None));
+    }
+
+    #[test]
+    fn pin_assigns_order_and_unpin_clears() {
+        let h = with_entries(None, vec![web(1), web(2), web(3)]);
+        act(&h, json!({"op": "pin", "port": 2})).unwrap();
+        act(&h, json!({"op": "pin", "port": 3})).unwrap();
+        assert_eq!(entry(&h, 2).unwrap().pin_order, 0);
+        assert_eq!(entry(&h, 3).unwrap().pin_order, 1);
+        act(&h, json!({"op": "pin", "port": 2, "value": true})).unwrap();
+        assert_eq!(entry(&h, 2).unwrap().pin_order, 0, "re-pinning keeps order");
+        act(&h, json!({"op": "pin", "port": 3, "value": false})).unwrap();
+        assert!(!entry(&h, 3).unwrap().pinned);
+        assert!(h.dir.path().join("state.json").exists());
+    }
+
+    #[test]
+    fn reorder_only_moves_pinned_entries() {
+        let pinned = |p| Entry {
+            pinned: true,
+            pin_order: 9,
+            ..web(p)
+        };
+        let h = with_entries(None, vec![pinned(1), pinned(2), web(3)]);
+        act(
+            &h,
+            json!({"op": "reorder", "value": [2, "junk", 1, 70000, 3]}),
+        )
+        .unwrap();
+        assert_eq!(entry(&h, 2).unwrap().pin_order, 0);
+        assert_eq!(entry(&h, 1).unwrap().pin_order, 1);
+        assert_eq!(entry(&h, 3).unwrap().pin_order, 0, "unpinned untouched");
+        assert_eq!(
+            act(&h, json!({"op": "reorder", "value": 5})),
+            Err("reorder needs a list of ports")
+        );
+    }
+
+    #[test]
+    fn hide_drops_the_thumbnail() {
+        let h = with_entries(
+            None,
+            vec![Entry {
+                thumb_at: 5,
+                ..web(1)
+            }],
+        );
+        let thumb = Store::thumb_path(h.dir.path(), 1);
+        std::fs::write(&thumb, "jpg").unwrap();
+        act(&h, json!({"op": "hide", "port": 1, "value": false})).unwrap();
+        assert!(thumb.exists());
+        act(&h, json!({"op": "hide", "port": 1})).unwrap();
+        let e = entry(&h, 1).unwrap();
+        assert!(e.hidden);
+        assert_eq!(e.thumb_at, 0);
+        assert!(!thumb.exists());
+    }
+
+    #[test]
+    fn rename_trims_caps_and_clears() {
+        let h = with_entries(None, vec![web(1)]);
+        act(&h, json!({"op": "rename", "port": 1, "value": "  Docs  "})).unwrap();
+        assert_eq!(entry(&h, 1).unwrap().label.as_deref(), Some("Docs"));
+        act(
+            &h,
+            json!({"op": "rename", "port": 1, "value": "é".repeat(200)}),
+        )
+        .unwrap();
+        assert_eq!(entry(&h, 1).unwrap().label.unwrap().chars().count(), 80);
+        act(&h, json!({"op": "rename", "port": 1, "value": "   "})).unwrap();
+        assert_eq!(entry(&h, 1).unwrap().label, None);
+        act(&h, json!({"op": "rename", "port": 1, "value": "x"})).unwrap();
+        act(&h, json!({"op": "rename", "port": 1, "value": 42})).unwrap();
+        assert_eq!(entry(&h, 1).unwrap().label, None);
+    }
+
+    #[test]
+    fn forget_and_clear_stale() {
+        let stale = Entry {
+            listening: false,
+            last_seen: 1,
+            ..web(2)
+        };
+        let h = with_entries(None, vec![web(1), stale]);
+        act(&h, json!({"op": "clear_stale"})).unwrap();
+        assert!(entry(&h, 2).is_none());
+        assert!(entry(&h, 1).is_some());
+        act(&h, json!({"op": "forget", "port": 1})).unwrap();
+        assert!(entry(&h, 1).is_none());
+        act(&h, json!({"op": "forget", "port": 9})).unwrap();
+    }
+
+    #[test]
+    fn invalid_actions_are_rejected() {
+        let h = with_entries(None, vec![web(1)]);
+        assert_eq!(act(&h, json!({"op": "pin"})), Err("missing port"));
+        assert_eq!(
+            act(&h, json!({"op": "pin", "port": 2})),
+            Err("unknown port")
+        );
+        assert_eq!(
+            act(&h, json!({"op": "explode", "port": 1})),
+            Err("unknown op")
+        );
+    }
+
+    #[test]
+    fn recapture_queues_one_capture() {
+        let h = with_entries(None, vec![web(1)]);
+        assert_eq!(
+            act(&h, json!({"op": "recapture", "port": 1})),
+            Err("no browser available for thumbnails")
+        );
+
+        let h = with_entries(
+            Some(PathBuf::from("/fake/browser")),
+            vec![Entry {
+                thumb_failed_at: 99,
+                ..web(1)
+            }],
+        );
+        act(&h, json!({"op": "recapture", "port": 1})).unwrap();
+        act(&h, json!({"op": "recapture", "port": 1})).unwrap();
+        assert_eq!(h.thumb_rx.try_recv(), Ok(1));
+        assert!(h.thumb_rx.try_recv().is_err(), "already queued");
+        assert_eq!(entry(&h, 1).unwrap().thumb_failed_at, 0);
+    }
+
+    // End-to-end through the real router on an ephemeral port.
+
+    struct Client {
+        port: u16,
+    }
+
+    struct Resp {
+        status: u16,
+        head: String,
+        body: Vec<u8>,
+    }
+
+    impl Resp {
+        fn header(&self, name: &str) -> Option<String> {
+            self.head.lines().find_map(|l| {
+                let (k, v) = l.split_once(':')?;
+                k.eq_ignore_ascii_case(name).then(|| v.trim().to_string())
+            })
+        }
+
+        fn json(&self) -> Value {
+            serde_json::from_slice(&self.body).unwrap()
+        }
+    }
+
+    fn live(browser: Option<PathBuf>) -> (Harness, Client) {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let h = harness(port, browser);
+        let shared = h.shared.clone();
+        thread::spawn(move || serve(server, shared));
+        (h, Client { port })
+    }
+
+    impl Client {
+        fn raw(
+            &self,
+            method: &str,
+            path: &str,
+            host: &str,
+            extra: &[(&str, &str)],
+            body: &str,
+        ) -> Resp {
+            let mut s = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+            s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut req =
+                format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+            for (k, v) in extra {
+                req.push_str(&format!("{k}: {v}\r\n"));
+            }
+            req.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+            s.write_all(req.as_bytes()).unwrap();
+            let mut buf = Vec::new();
+            s.read_to_end(&mut buf).unwrap();
+            let split = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let head = String::from_utf8_lossy(&buf[..split]).to_string();
+            Resp {
+                status: head[9..12].parse().unwrap(),
+                head,
+                body: buf[split + 4..].to_vec(),
+            }
+        }
+
+        fn host(&self) -> String {
+            format!("localhost:{}", self.port)
+        }
+
+        fn get(&self, path: &str) -> Resp {
+            self.raw("GET", path, &self.host(), &[], "")
+        }
+
+        fn post(&self, path: &str, body: &str) -> Resp {
+            self.raw(
+                "POST",
+                path,
+                &self.host(),
+                &[("Content-Type", "application/json")],
+                body,
+            )
+        }
+    }
+
+    #[test]
+    fn serves_the_static_ui() {
+        let (_h, s) = live(None);
+        for (path, ctype, content) in [
+            ("/", "text/html; charset=utf-8", INDEX),
+            ("/style.css", "text/css; charset=utf-8", STYLE),
+            ("/app.js", "text/javascript; charset=utf-8", APP),
+            ("/favicon.svg", "image/svg+xml", FAVICON),
+        ] {
+            let r = s.get(path);
+            assert_eq!(r.status, 200, "{path}");
+            assert_eq!(r.header("Content-Type").as_deref(), Some(ctype));
+            assert_eq!(
+                r.header("X-Content-Type-Options").as_deref(),
+                Some("nosniff")
+            );
+            assert_eq!(r.body, content.as_bytes());
+        }
+        assert_eq!(s.get("/nope").status, 404);
+        assert_eq!(s.post("/", "").status, 404);
+    }
+
+    #[test]
+    fn rejects_foreign_hosts() {
+        let (_h, s) = live(None);
+        let evil = format!("evil.example:{}", s.port);
+        assert_eq!(s.raw("GET", "/", &evil, &[], "").status, 403);
+        assert_eq!(
+            s.raw("GET", "/api/state", "localhost:1", &[], "").status,
+            403
+        );
+        assert_eq!(
+            s.raw("GET", "/", &format!("127.0.0.1:{}", s.port), &[], "")
+                .status,
+            200
+        );
+    }
+
+    #[test]
+    fn state_endpoint_supports_conditional_polling() {
+        let (_h, s) = live(None);
+        let r = s.get("/api/state");
+        assert_eq!(r.status, 200);
+        assert_eq!(r.header("Cache-Control").as_deref(), Some("no-store"));
+        assert!(r.header("X-Scanned-At").is_some());
+        let state = r.json();
+        assert_eq!(state["thumbs"], false);
+        assert_eq!(state["stale_minutes"], 10);
+        assert_eq!(state["services"], json!([]));
+        let v = state["version"].as_u64().unwrap();
+
+        let r = s.get(&format!("/api/state?v={v}"));
+        assert_eq!(r.status, 304);
+        assert!(r.body.is_empty());
+        assert_eq!(s.get(&format!("/api/state?v={}", v + 1)).status, 200);
+    }
+
+    #[test]
+    fn state_poll_wakes_the_scanner_and_records_thumb_preference() {
+        let (h, s) = live(None);
+        s.get("/api/state");
+        assert!(
+            h.scan_rx.try_recv().is_err(),
+            "already active: no extra scan"
+        );
+
+        s.get("/api/state?thumbs=0");
+        assert!(!h.shared.store.lock().unwrap().thumbs_wanted);
+        assert!(h.scan_rx.try_recv().is_err());
+
+        s.get("/api/state?thumbs=1");
+        assert!(h.shared.store.lock().unwrap().thumbs_wanted);
+        assert!(matches!(
+            h.scan_rx.try_recv(),
+            Ok(ScanMsg::Refresh {
+                force: false,
+                done: None
+            })
+        ));
+
+        if let Some(earlier) = Instant::now().checked_sub(Duration::from_secs(60)) {
+            h.shared.store.lock().unwrap().last_client = earlier;
+            s.get("/api/state");
+            assert!(
+                h.scan_rx.try_recv().is_ok(),
+                "first poll after idle rescans"
+            );
+            assert!(h.shared.store.lock().unwrap().client_active());
+        }
+    }
+
+    #[test]
+    fn actions_over_http() {
+        let (h, s) = live(None);
+        {
+            let mut store = h.shared.store.lock().unwrap();
+            store.entries.insert(3000, web(3000));
+            store.refresh_view();
+        }
+        let r = s.post(
+            "/api/action",
+            r#"{"op":"rename","port":3000,"value":"Docs"}"#,
+        );
+        assert_eq!(r.status, 200);
+        assert_eq!(r.json()["services"][0]["name"], "Docs");
+
+        assert_eq!(s.post("/api/action", "{not json").status, 400);
+        let r = s.post("/api/action", r#"{"op":"pin","port":1}"#);
+        assert_eq!(
+            (r.status, r.body.as_slice()),
+            (400, b"unknown port".as_slice())
+        );
+
+        let plain = s.raw(
+            "POST",
+            "/api/action",
+            &s.host(),
+            &[("Content-Type", "text/plain")],
+            r#"{"op":"forget","port":3000}"#,
+        );
+        assert_eq!(plain.status, 403);
+        let cross = s.raw(
+            "POST",
+            "/api/action",
+            &s.host(),
+            &[
+                ("Content-Type", "application/json"),
+                ("Origin", "http://evil.example"),
+            ],
+            r#"{"op":"forget","port":3000}"#,
+        );
+        assert_eq!(cross.status, 403);
+        assert!(h.shared.store.lock().unwrap().entries.contains_key(&3000));
+
+        let origin = format!("http://{}", s.host());
+        let same = s.raw(
+            "POST",
+            "/api/action",
+            &s.host(),
+            &[("Content-Type", "application/json"), ("Origin", &origin)],
+            r#"{"op":"forget","port":3000}"#,
+        );
+        assert_eq!(same.status, 200);
+        assert!(!h.shared.store.lock().unwrap().entries.contains_key(&3000));
+    }
+
+    #[test]
+    fn refresh_waits_for_a_forced_scan() {
+        let (h, s) = live(None);
+        let (shared, scan_rx) = (h.shared.clone(), h.scan_rx);
+        // A slow scanner that discovers a service: the response must include it.
+        let scanner = thread::spawn(move || match scan_rx.recv().unwrap() {
+            ScanMsg::Refresh { force, done } => {
+                thread::sleep(Duration::from_millis(300));
+                let mut store = shared.store.lock().unwrap();
+                store.entries.insert(3000, web(3000));
+                store.refresh_view();
+                drop(store);
+                done.unwrap().send(()).unwrap();
+                force
+            }
+        });
+        assert_eq!(
+            s.raw("POST", "/api/refresh", &s.host(), &[], "").status,
+            403
+        );
+        let r = s.post("/api/refresh", "");
+        assert_eq!(r.status, 200);
+        assert_eq!(r.json()["services"][0]["port"], 3000);
+        assert!(scanner.join().unwrap(), "refresh forces a full re-probe");
+    }
+
+    #[test]
+    fn serves_cached_thumbnails_only() {
+        let (h, s) = live(None);
+        std::fs::write(Store::thumb_path(h.dir.path(), 3000), b"jpegbytes").unwrap();
+        let r = s.get("/thumb/3000?v=1");
+        assert_eq!(r.status, 200);
+        assert_eq!(r.header("Content-Type").as_deref(), Some("image/jpeg"));
+        assert_eq!(
+            r.header("Cache-Control").as_deref(),
+            Some("max-age=31536000, immutable")
+        );
+        assert_eq!(r.body, b"jpegbytes");
+        assert_eq!(s.get("/thumb/3001").status, 404);
+        assert_eq!(s.get("/thumb/abc").status, 404);
+        assert_eq!(s.get("/thumb/../state.json").status, 404);
+    }
 }
