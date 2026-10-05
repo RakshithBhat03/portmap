@@ -43,6 +43,16 @@ brew services start portmap   # starts at login, restarts on crash
 open http://localhost:7878
 ```
 
+Homebrew 6.0+ only loads formulae from third-party taps you've [trusted](https://docs.brew.sh/Tap-Trust).
+Installing by the full name above trusts just the `portmap` formula, not the rest of the tap. If you
+tapped first and want to install by short name, trust the formula yourself:
+
+```sh
+brew tap rakshithbhat03/tap
+brew trust --formula rakshithbhat03/tap/portmap
+brew install portmap
+```
+
 After `brew upgrade portmap`, run `brew services restart portmap`. Logs go to
 `$(brew --prefix)/var/log/portmap.log`. Use either `brew services` or `portmap install` below, not
 both; they would compete for the same port.
