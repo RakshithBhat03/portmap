@@ -5,6 +5,7 @@
 //! cached thumbnail. Pinned entries never expire; they show as `offline` instead.
 //! Non-service listeners are listed as `other` and dropped as soon as they stop.
 
+use crate::tailnet::Tailnet;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -43,6 +44,9 @@ pub struct Entry {
     pub listening: bool,
     #[serde(skip)]
     pub pid: u32,
+    /// Bind addresses from lsof (`*`, `127.0.0.1`, ...), to tell if the tailnet can reach it.
+    #[serde(skip)]
+    pub addrs: Vec<String>,
     #[serde(skip)]
     pub probed_at: u64,
     #[serde(skip)]
@@ -101,6 +105,14 @@ struct ServiceView<'a> {
     /// Only for entries that are gone; live entries omit it so the view stays stable
     /// between scans and clients get cheap 304s.
     last_seen: Option<u64>,
+    /// Link for other devices on the tailnet, when one exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_url: Option<String>,
+    /// How the tailnet reaches a web entry: `direct` (bound beyond loopback), `shared` (a
+    /// `tailscale serve` mapping portmap can toggle), `served` (one the user set up some
+    /// other way) or `local` (loopback only). Absent without Tailscale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tailnet: Option<&'static str>,
 }
 
 pub struct Store {
@@ -113,6 +125,11 @@ pub struct Store {
     /// Last preference reported by a polling page. While the UI has thumbnails switched
     /// off, no browser is launched at all.
     pub thumbs_wanted: bool,
+    /// This machine's tailnet identity and serve mappings; `None` without Tailscale.
+    pub tailnet: Option<Tailnet>,
+    pub tailnet_checked: Option<Instant>,
+    pub tailnet_failures: u32,
+    view_tailnet: Option<String>,
     dir: PathBuf,
 }
 
@@ -130,6 +147,10 @@ impl Store {
             last_client: Instant::now(),
             thumb_queue: HashSet::new(),
             thumbs_wanted: true,
+            tailnet: None,
+            tailnet_checked: None,
+            tailnet_failures: 0,
+            view_tailnet: None,
             dir: dir.to_path_buf(),
         };
         store.sweep_orphan_thumbs();
@@ -209,10 +230,27 @@ impl Store {
     /// Re-render the public view and bump the version if anything a client can see changed.
     pub fn refresh_view(&mut self) {
         let home = std::env::var("HOME").unwrap_or_default();
+        let tailnet = self.tailnet.as_ref();
         let views: Vec<ServiceView> = self
             .entries
             .values()
-            .map(|e| ServiceView {
+            .map(|e| {
+                let (remote_url, reach) = match tailnet.filter(|_| e.http) {
+                    None => (None, None),
+                    Some(t) => match t.serve_for(e.port) {
+                        Some(s) => (
+                            Some(t.serve_url(s)),
+                            Some(if s.owned { "shared" } else { "served" }),
+                        ),
+                        None if e.listening && t.reaches(&e.addrs) => {
+                            (Some(t.direct_url(e.port)), Some("direct"))
+                        }
+                        None => (None, Some("local")),
+                    },
+                };
+                (e, remote_url, reach)
+            })
+            .map(|(e, remote_url, reach)| ServiceView {
                 port: e.port,
                 url: e.url(),
                 name: e
@@ -238,11 +276,15 @@ impl Store {
                 thumb: (e.thumb_at > 0).then(|| format!("/thumb/{}?v={}", e.port, e.thumb_at)),
                 first_seen: e.first_seen,
                 last_seen: (!e.listening).then_some(e.last_seen),
+                remote_url,
+                tailnet: reach,
             })
             .collect();
         let json = serde_json::to_string(&views).unwrap_or_else(|_| "[]".into());
-        if json != self.view_json {
+        let host = tailnet.map(|t| t.host.clone());
+        if json != self.view_json || host != self.view_tailnet {
             self.view_json = json;
+            self.view_tailnet = host;
             self.version += 1;
         }
     }

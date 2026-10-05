@@ -1,0 +1,23 @@
+# Gives portmap its own tailnet node (https://${TS_HOSTNAME}.<tailnet>.ts.net), tailnet-only.
+# portmap keeps running on the host, bound to loopback; this container only proxies to it.
+# Without TS_AUTHKEY the first start prints a login URL in `docker compose logs tailscale`;
+# the node identity then lives in the volume. Also set PORTMAP_ALLOWED_HOSTS to the node's
+# name on the portmap process, or its Host-header guard answers 403.
+#   docker compose -f compose.tailscale.yaml up -d
+services:
+  tailscale:
+    image: tailscale/tailscale:stable
+    hostname: ${TS_HOSTNAME:-portmap}
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_HOSTNAME: ${TS_HOSTNAME:-portmap}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_USERSPACE: "true"
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - ./tailscale/serve.json:/config/serve.json:ro
+    restart: unless-stopped
+
+volumes:
+  tailscale-state:

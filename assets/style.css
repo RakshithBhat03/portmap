@@ -292,3 +292,7 @@ details[open] summary h2::before { content: '\2212'; }
 @media (prefers-reduced-motion: reduce) {
   .card.enter, #refresh.spinning svg { animation: none; }
 }
+.actions [data-op='share'].on { color: var(--green); }
+.actions [data-op='share'].on svg { fill: none; }
+.actions button:disabled { opacity: 0.4; cursor: progress; }
+.card .hit:not([href]) { cursor: not-allowed; }
